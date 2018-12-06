@@ -4,14 +4,37 @@ from rubik.estimator.mp_wapper import MPWapper, Future
 from rubik.summary import RubikSummary
 import horovod.torch as hvd
 from horovod.torch.mpi_ops import allreduce_async_, all_gather
+import time
 
 class MPEstimator(MPWapper):
     def __init__(self, hparams, model, devcies_ids=None, multiprocessing_method='fork'):
         super().__init__(device_ids, multiprocessing_method)
-
+        if device_ids is not None:
+            device_ids = [int(item) for item in device_ids.split(',')]
+            logging.info("multiprocess use devices {}".format(device_ids))
+        else:
+            device_ids = list(range(torch.cuda.device_count()))
+            logging.info("multiprocess use devices {}".format(device_ids))
+        super().__init__(device_ids, multiprocessing_method)
+        self.allreduce_freq = hparams.allreduce_freq
+        if not torch.cuda.is_available():
+            raise NotImplementedError('Training Without GPU Not Supported')
         model = model.share_memory()
         nccl_uid = nccl.get_unique_id()
+        time_format = time.time()
+        hparams.model_dir = hparams.job_name
+        hparams.summary_dir = hparams.job_name+'/summary'
         self.init(hparams, model, nccl_uid)
+        self.top5_results = {}
+        if hparams.checkppoint is not None:
+            self.epoch_idx, self.batch_shift = self.load_checkpoint(hparams.checkpoint)
+        else:
+            self.epoch_idx, self.batch_shift = 0,0
+        latest_checkpoint = hparmams.model_dir+'/latest.cpt'
+        if os.path.isfile(latest_checkpoint):
+            logging.info("Resume from the latest checkpoint {}".format(latest_checkpoint))
+            self.load_checkpoint(latest_checkpoint)
+        self.top5_results = {}
         
     #init 
     def init(self, hparams, model, nccl_uid):
@@ -20,13 +43,14 @@ class MPEstimator(MPWapper):
                             model=model, nccl_uid=nccl_uid)
                         for rank in range(self.num_replicas)])
     def _async_init(self, rank, device_id, hparams, model, nccl_uid):
+        self.hparams = hparams
         torch.manual_seed(hparams.seed)
         torch.cuda.set_device(device_id)
         nccl.initialize(self.num_replicas, nccl_uid, device_id)
         self.model = model.cuda()
         self.train_states = None #this should contain the params and batchnorm states
-        self.optimizer = MixedAdam(self.model.parameters())
-        self.lr_scheduler = WarmupLRSheduler(self.optimizer)
+        self.optimizer = MixedAdam(self.model.parameters(), hparams)
+        self.lr_scheduler = WarmupLRSheduler(self.optimizer, hparams)
         self.flat_grads = None
         self.flat_param_buffer = None
 
@@ -137,6 +161,20 @@ class MPEstimator(MPWapper):
                 synchronize(handle)
 
 
+    def scatter_batch_data(self, batch_list):
+        Future.gen_list([
+            self.call_async(rank, '_async_scatter_batch_data', batch_data=batch_list[rank])
+            for rank in range(self.num_replicas)
+        ])
+
+    def _async_scatter_batch_data(self, rank, device_id, batch_data):
+        if batch_data is not None:
+            for item_k, item_v in batch_data.items():
+                if isinstance(item_v, torch.Tensor):
+                    batch_data[item_k] = item_v.cuda(device_id)
+            self.batch_data = batch_data
+        else:
+            self.batch_data = None
 
 
         
